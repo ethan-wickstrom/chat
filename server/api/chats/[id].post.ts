@@ -10,6 +10,36 @@ defineRouteMeta({
   }
 })
 
+function getMessageText(message: UIMessage | undefined) {
+  if (!message) {
+    return ''
+  }
+
+  return message.parts.map((part) => {
+    if (part.type !== 'text') {
+      return ''
+    }
+
+    return 'text' in part && typeof part.text === 'string' ? part.text : ''
+  }).filter(Boolean).join('\n').trim()
+}
+
+function getErrorMessage(error: unknown) {
+  if (error instanceof Error) {
+    return error.message
+  }
+
+  if (typeof error === 'string') {
+    return error
+  }
+
+  try {
+    return JSON.stringify(error)
+  } catch {
+    return 'Unknown stream error'
+  }
+}
+
 export default defineEventHandler(async (event) => {
   const session = await getUserSession(event)
 
@@ -56,12 +86,57 @@ export default defineEventHandler(async (event) => {
     })
   }
 
+  const userId = session.user?.id || session.id
+  const task = getMessageText(lastMessage) || 'Continue the conversation'
+  const { traceId, recalled } = await beginReasoningTrace({
+    sessionId: chat.id,
+    userId,
+    task,
+    model,
+    recallLimit: 3
+  })
+  const recalledContext = formatRecalledReasoning(recalled)
+  const system = [
+    'You are a helpful assistant that can answer questions and help.',
+    recalledContext
+  ].filter(Boolean).join('\n\n')
+
+  let stepIndex = 0
+  let streamError: string | null = null
+
   const stream = createUIMessageStream({
     execute: ({ writer }) => {
       const result = streamText({
         model: gateway(model),
-        system: 'You are a helpful assistant that can answer questions and help.',
-        messages: convertToModelMessages(messages)
+        system,
+        messages: convertToModelMessages(messages),
+        onStepFinish: async ({ finishReason, text, toolCalls, toolResults, usage }) => {
+          await recordReasoningStep(traceId, stepIndex++, {
+            finishReason,
+            text,
+            toolCalls,
+            toolResults,
+            usage
+          })
+        },
+        onError: ({ error }) => {
+          streamError = getErrorMessage(error)
+          void completeReasoningTrace(traceId, {
+            success: false,
+            finishReason: 'error',
+            errorKind: 'stream_error',
+            error: streamError
+          })
+        },
+        onFinish: async ({ text, finishReason }) => {
+          await completeReasoningTrace(traceId, {
+            success: streamError === null && finishReason !== 'error',
+            finishReason,
+            responseText: text,
+            errorKind: streamError ? 'stream_error' : null,
+            error: streamError
+          })
+        }
       })
 
       if (!chat.title) {
